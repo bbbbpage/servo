@@ -820,55 +820,42 @@ impl HTMLScriptElement {
         let global = window.upcast::<GlobalScope>();
         let _aes = AutoEntryScript::new(&global);
 
-        if script.external {
+        let module_tree = if script.external {
             let module_map = global.get_module_map().borrow();
-
-            if let Some(module_tree) = module_map.get(&script.url) {
-                // Step 6.
-                {
-                    let module_error = module_tree.get_rethrow_error().borrow();
-                    let network_error = module_tree.get_network_error().borrow();
-                    if module_error.is_some() && network_error.is_none() {
-                        module_tree.report_error(&global);
-                        return;
-                    }
-                }
-
-                let module_record = module_tree.get_record().borrow();
-                if let Some(record) = &*module_record {
-                    let evaluated = module_tree.execute_module(global, record.handle());
-
-                    if let Err(exception) = evaluated {
-                        module_tree.set_rethrow_error(exception);
-                        module_tree.report_error(&global);
-                        return;
-                    }
-                }
+            match module_map.get(&script.url) {
+                Some(tree) => tree.clone(),
+                None => unreachable!(
+                    "We should have the module in module map when we're going to run it"
+                ),
             }
         } else {
             let inline_module_map = global.get_inline_module_map().borrow();
+            match inline_module_map.get(&self.id.clone()) {
+                Some(tree) => tree.clone(),
+                None => unreachable!(
+                    "We should have the module in module map when we're going to run it"
+                ),
+            }
+        };
 
-            if let Some(module_tree) = inline_module_map.get(&self.id.clone()) {
-                // Step 6.
-                {
-                    let module_error = module_tree.get_rethrow_error().borrow();
-                    let network_error = module_tree.get_network_error().borrow();
-                    if module_error.is_some() && network_error.is_none() {
-                        module_tree.report_error(&global);
-                        return;
-                    }
-                }
+        // Step 6.
+        {
+            let module_error = module_tree.get_rethrow_error().borrow();
+            let network_error = module_tree.get_network_error().borrow();
+            if module_error.is_some() && network_error.is_none() {
+                module_tree.report_error(&global);
+                return;
+            }
+        }
 
-                let module_record = module_tree.get_record().borrow();
-                if let Some(record) = &*module_record {
-                    let evaluated = module_tree.execute_module(global, record.handle());
+        let module_record = module_tree.get_record().borrow();
+        if let Some(record) = &*module_record {
+            let evaluated = module_tree.execute_module(global, record.handle());
 
-                    if let Err(exception) = evaluated {
-                        module_tree.set_rethrow_error(exception);
-                        module_tree.report_error(&global);
-                        return;
-                    }
-                }
+            if let Err(exception) = evaluated {
+                module_tree.set_rethrow_error(exception);
+                module_tree.report_error(&global);
+                return;
             }
         }
     }
