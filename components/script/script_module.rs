@@ -65,7 +65,6 @@ use net_traits::{FetchMetadata, Metadata};
 use net_traits::{FetchResponseListener, NetworkError};
 use net_traits::{ResourceFetchTiming, ResourceTimingType};
 use servo_url::ServoUrl;
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi;
 use std::rc::Rc;
@@ -74,11 +73,11 @@ use std::sync::{Arc, Mutex};
 use url::ParseError as UrlParseError;
 
 #[allow(unsafe_code)]
-unsafe fn gen_type_error(global: &GlobalScope, string: String) -> ModuleError {
+unsafe fn gen_type_error(global: &GlobalScope, string: String) -> RethrowError {
     rooted!(in(*global.get_cx()) let mut thrown = UndefinedValue());
     Error::Type(string).to_jsval(*global.get_cx(), &global, thrown.handle_mut());
 
-    return ModuleError::RawException(RootedTraceableBox::from_box(Heap::boxed(thrown.get())));
+    return RethrowError(RootedTraceableBox::from_box(Heap::boxed(thrown.get())));
 }
 
 #[derive(JSTraceable)]
@@ -92,57 +91,19 @@ impl ModuleObject {
 }
 
 #[derive(JSTraceable)]
-pub enum ModuleError {
-    Network(NetworkError),
-    RawException(RootedTraceableBox<Heap<JSVal>>),
-}
+pub struct RethrowError(RootedTraceableBox<Heap<JSVal>>);
 
-impl Eq for ModuleError {}
-
-impl PartialEq for ModuleError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Network(_), Self::RawException(_)) |
-            (Self::RawException(_), Self::Network(_)) => false,
-            _ => true,
-        }
+impl RethrowError {
+    fn handle(&self) -> Handle<JSVal> {
+        self.0.handle()
     }
 }
 
-impl Ord for ModuleError {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (Self::Network(_), Self::RawException(_)) => Ordering::Greater,
-            (Self::RawException(_), Self::Network(_)) => Ordering::Less,
-            _ => Ordering::Equal,
-        }
-    }
-}
-
-impl PartialOrd for ModuleError {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl ModuleError {
-    #[allow(unsafe_code)]
-    pub fn handle(&self) -> Handle<JSVal> {
-        match self {
-            Self::Network(_) => unreachable!(),
-            Self::RawException(exception) => exception.handle(),
-        }
-    }
-}
-
-impl Clone for ModuleError {
+impl Clone for RethrowError {
     fn clone(&self) -> Self {
-        match self {
-            Self::Network(network_error) => Self::Network(network_error.clone()),
-            Self::RawException(exception) => Self::RawException(RootedTraceableBox::from_box(
-                Heap::boxed(exception.get().clone()),
-            )),
-        }
+        Self(RootedTraceableBox::from_box(Heap::boxed(
+            self.0.get().clone(),
+        )))
     }
 }
 
@@ -181,7 +142,8 @@ pub struct ModuleTree {
     parent_identities: DomRefCell<IndexSet<ModuleIdentity>>,
     descendant_urls: DomRefCell<IndexSet<ServoUrl>>,
     visited_urls: DomRefCell<HashSet<ServoUrl>>,
-    error: DomRefCell<Option<ModuleError>>,
+    rethrow_error: DomRefCell<Option<RethrowError>>,
+    network_error: DomRefCell<Option<NetworkError>>,
     // A promise for owners to execute when the module tree
     // is finished
     promise: DomRefCell<Option<Rc<Promise>>>,
@@ -198,7 +160,8 @@ impl ModuleTree {
             parent_identities: DomRefCell::new(IndexSet::new()),
             descendant_urls: DomRefCell::new(IndexSet::new()),
             visited_urls: DomRefCell::new(visited_urls),
-            error: DomRefCell::new(None),
+            rethrow_error: DomRefCell::new(None),
+            network_error: DomRefCell::new(None),
             promise: DomRefCell::new(None),
             external,
         }
@@ -220,12 +183,20 @@ impl ModuleTree {
         *self.record.borrow_mut() = Some(record);
     }
 
-    pub fn get_error(&self) -> &DomRefCell<Option<ModuleError>> {
-        &self.error
+    pub fn get_rethrow_error(&self) -> &DomRefCell<Option<RethrowError>> {
+        &self.rethrow_error
     }
 
-    pub fn set_error(&self, error: Option<ModuleError>) {
-        *self.error.borrow_mut() = error;
+    pub fn set_rethrow_error(&self, rethrow_error: RethrowError) {
+        *self.rethrow_error.borrow_mut() = Some(rethrow_error);
+    }
+
+    pub fn get_network_error(&self) -> &DomRefCell<Option<NetworkError>> {
+        &self.network_error
+    }
+
+    pub fn set_network_error(&self, network_error: NetworkError) {
+        *self.network_error.borrow_mut() = Some(network_error);
     }
 
     pub fn get_text(&self) -> &DomRefCell<DOMString> {
@@ -332,7 +303,7 @@ impl ModuleTree {
         global: &GlobalScope,
         module_script_text: DOMString,
         url: ServoUrl,
-    ) -> Result<ModuleObject, ModuleError> {
+    ) -> Result<ModuleObject, RethrowError> {
         let module: Vec<u16> = module_script_text.encode_utf16().collect();
 
         let url_cstr = ffi::CString::new(url.as_str().as_bytes()).unwrap();
@@ -359,9 +330,9 @@ impl ModuleTree {
                 ));
                 JS_ClearPendingException(*global.get_cx());
 
-                return Err(ModuleError::RawException(RootedTraceableBox::from_box(
-                    Heap::boxed(exception.get()),
-                )));
+                return Err(RethrowError(RootedTraceableBox::from_box(Heap::boxed(
+                    exception.get(),
+                ))));
             }
 
             let module_script_data = Box::new(ModuleScript {
@@ -391,7 +362,7 @@ impl ModuleTree {
         &self,
         global: &GlobalScope,
         module_record: HandleObject,
-    ) -> Result<(), ModuleError> {
+    ) -> Result<(), RethrowError> {
         let _ac = JSAutoRealm::new(*global.get_cx(), *global.reflector().get_jsobject());
 
         unsafe {
@@ -405,9 +376,9 @@ impl ModuleTree {
                 ));
                 JS_ClearPendingException(*global.get_cx());
 
-                Err(ModuleError::RawException(RootedTraceableBox::from_box(
-                    Heap::boxed(exception.get()),
-                )))
+                Err(RethrowError(RootedTraceableBox::from_box(Heap::boxed(
+                    exception.get(),
+                ))))
             } else {
                 debug!("module instantiated successfully");
 
@@ -421,7 +392,7 @@ impl ModuleTree {
         &self,
         global: &GlobalScope,
         module_record: HandleObject,
-    ) -> Result<(), ModuleError> {
+    ) -> Result<(), RethrowError> {
         let _ac = JSAutoRealm::new(*global.get_cx(), *global.reflector().get_jsobject());
 
         unsafe {
@@ -435,9 +406,9 @@ impl ModuleTree {
                 ));
                 JS_ClearPendingException(*global.get_cx());
 
-                Err(ModuleError::RawException(RootedTraceableBox::from_box(
-                    Heap::boxed(exception.get()),
-                )))
+                Err(RethrowError(RootedTraceableBox::from_box(Heap::boxed(
+                    exception.get(),
+                ))))
             } else {
                 debug!("module evaluated successfully");
                 Ok(())
@@ -447,7 +418,7 @@ impl ModuleTree {
 
     #[allow(unsafe_code)]
     pub fn report_error(&self, global: &GlobalScope) {
-        let module_error = self.error.borrow();
+        let module_error = self.rethrow_error.borrow();
 
         if let Some(exception) = &*module_error {
             unsafe {
@@ -467,7 +438,7 @@ impl ModuleTree {
     pub fn resolve_requested_modules(
         &self,
         global: &GlobalScope,
-    ) -> Result<IndexSet<ServoUrl>, ModuleError> {
+    ) -> Result<IndexSet<ServoUrl>, RethrowError> {
         let status = self.get_status();
 
         assert_ne!(status, ModuleStatus::Initial);
@@ -509,7 +480,7 @@ impl ModuleTree {
         global: &GlobalScope,
         module_object: HandleObject,
         base_url: ServoUrl,
-    ) -> Result<IndexSet<ServoUrl>, ModuleError> {
+    ) -> Result<IndexSet<ServoUrl>, RethrowError> {
         let _ac = JSAutoRealm::new(*global.get_cx(), *global.reflector().get_jsobject());
 
         let mut specifier_urls = IndexSet::new();
@@ -602,21 +573,24 @@ impl ModuleTree {
         &self,
         global: &GlobalScope,
         discovered_urls: &mut HashSet<ServoUrl>,
-    ) -> Option<ModuleError> {
+    ) -> (Option<NetworkError>, Option<RethrowError>) {
         // 3.
         discovered_urls.insert(self.url.clone());
 
         // 4.
-        let module_map = global.get_module_map().borrow();
         let record = self.get_record().borrow();
         if record.is_none() {
-            return self.error.borrow().clone();
+            return (
+                self.network_error.borrow().clone(),
+                self.rethrow_error.borrow().clone(),
+            );
         }
 
-        // 5-6.
-        let mut errors: Vec<ModuleError> = Vec::new();
-        let descendant_urls = self.descendant_urls.borrow();
+        let module_map = global.get_module_map().borrow();
+        let mut parse_error: Option<RethrowError> = None;
 
+        // 5-6.
+        let descendant_urls = self.descendant_urls.borrow();
         for descendant_module in descendant_urls
             .iter()
             // 7.
@@ -628,17 +602,27 @@ impl ModuleTree {
             }
 
             // 8-3.
-            let child_parse_error =
+            let (child_network_error, child_parse_error) =
                 descendant_module.find_first_parse_error(&global, discovered_urls);
 
+            // Due to network error's priority higher than parse error,
+            // we will return directly when we meet a network error.
+            if child_network_error.is_some() {
+                return (child_network_error, None);
+            }
+
             // 8-4.
-            if let Some(child_error) = child_parse_error {
-                errors.push(child_error);
+            //
+            // In case of having any network error in other descendants,
+            // we will store the "first" parse error and keep running this
+            // loop to ensure we don't have any network error.
+            if child_parse_error.is_some() && parse_error.is_none() {
+                parse_error = child_parse_error;
             }
         }
 
         // Step 9.
-        return errors.into_iter().max();
+        return (None, parse_error);
     }
 
     #[allow(unsafe_code)]
@@ -706,7 +690,7 @@ impl ModuleTree {
                 }
             },
             Err(error) => {
-                self.set_error(Some(error));
+                self.set_rethrow_error(error);
                 self.advance_finished_and_link(&global);
             },
         }
@@ -768,27 +752,27 @@ impl ModuleTree {
         }
 
         let mut discovered_urls: HashSet<ServoUrl> = HashSet::new();
-        let module_error = self.find_first_parse_error(&global, &mut discovered_urls);
+        let (network_error, rethrow_error) =
+            self.find_first_parse_error(&global, &mut discovered_urls);
 
-        match module_error {
-            None => {
+        match (network_error, rethrow_error) {
+            (Some(network_error), _) => {
+                self.set_network_error(network_error);
+            },
+            (None, None) => {
                 let module_record = self.get_record().borrow();
                 if let Some(record) = &*module_record {
                     let instantiated = self.instantiate_module_tree(&global, record.handle());
 
                     if let Err(exception) = instantiated {
-                        self.set_error(Some(exception.clone()));
+                        self.set_rethrow_error(exception);
                     }
                 }
             },
-            Some(error) => {
-                let mut current_error = self.error.borrow_mut();
-                match current_error.as_ref() {
-                    Some(ce) if ce > &error => {},
-                    _ => *current_error = Some(error),
-                }
+            (None, Some(error)) => {
+                self.set_rethrow_error(error);
             },
-        };
+        }
 
         let promise = self.promise.borrow();
         if let Some(promise) = promise.as_ref() {
@@ -863,10 +847,10 @@ impl ModuleOwner {
                         },
                     };
 
-                    let module_error = module_tree.get_error().borrow();
-                    match module_error.as_ref() {
-                        Some(ModuleError::Network(network_error)) => Err(network_error.clone()),
-                        _ => match module_identity {
+                    let network_error = module_tree.get_network_error().borrow();
+                    match network_error.as_ref() {
+                        Some(network_error) => Err(network_error.clone()),
+                        None => match module_identity {
                             ModuleIdentity::ModuleUrl(script_src) => Ok(ScriptOrigin::external(
                                 module_tree.get_text().borrow().clone(),
                                 script_src.clone(),
@@ -1010,7 +994,7 @@ impl FetchResponseListener for ModuleContext {
                 module_map.get(&self.url.clone()).unwrap().clone()
             };
 
-            module_tree.set_error(Some(ModuleError::Network(err)));
+            module_tree.set_network_error(err);
             module_tree.advance_finished_and_link(&global);
 
             return;
@@ -1033,7 +1017,7 @@ impl FetchResponseListener for ModuleContext {
 
             match compiled_module {
                 Err(exception) => {
-                    module_tree.set_error(Some(exception));
+                    module_tree.set_rethrow_error(exception);
                     module_tree.advance_finished_and_link(&global);
                 },
                 Ok(record) => {
@@ -1360,7 +1344,7 @@ pub fn fetch_inline_module_script(
             );
         },
         Err(exception) => {
-            module_tree.set_error(Some(exception));
+            module_tree.set_rethrow_error(exception);
             module_tree.set_status(ModuleStatus::Finished);
             global.set_inline_module_map(script_id.clone(), module_tree);
             owner.notify_owner_to_finish(ModuleIdentity::ScriptId(script_id));
