@@ -666,13 +666,10 @@ impl ModuleTree {
 
                 for requested_url in requested_urls {
                     // https://html.spec.whatwg.org/multipage/#internal-module-script-graph-fetching-procedure
-                    let visited_urls = {
-                        let visited_urls = self.visited_urls.borrow().clone();
+                    let visited_urls = self.visited_urls.borrow().clone();
 
-                        // Step 1.
-                        assert!(visited_urls.get(&requested_url).is_some());
-                        visited_urls
-                    };
+                    // Step 1.
+                    assert!(visited_urls.get(&requested_url).is_some());
 
                     // Step 2.
                     fetch_single_module_script(
