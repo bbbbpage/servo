@@ -125,6 +125,21 @@ pub enum ModuleIdentity {
     ModuleUrl(ServoUrl),
 }
 
+impl ModuleIdentity {
+    pub fn get_module_tree(&self, global: &GlobalScope) -> Rc<ModuleTree> {
+        match self {
+            ModuleIdentity::ModuleUrl(url) => {
+                let module_map = global.get_module_map().borrow();
+                module_map.get(&url.clone()).unwrap().clone()
+            },
+            ModuleIdentity::ScriptId(script_id) => {
+                let inline_module_map = global.get_inline_module_map().borrow();
+                inline_module_map.get(&script_id).unwrap().clone()
+            },
+        }
+    }
+}
+
 #[derive(JSTraceable)]
 pub struct ModuleTree {
     url: ServoUrl,
@@ -713,16 +728,7 @@ impl ModuleTree {
 
         let parent_identities = self.parent_identities.borrow();
         for parent_identity in parent_identities.iter() {
-            let parent_tree = match parent_identity {
-                ModuleIdentity::ScriptId(script_id) => {
-                    let inline_module_map = global.get_inline_module_map().borrow();
-                    inline_module_map.get(&script_id).unwrap().clone()
-                },
-                ModuleIdentity::ModuleUrl(url) => {
-                    let module_map = global.get_module_map().borrow();
-                    module_map.get(&url.clone()).unwrap().clone()
-                },
-            };
+            let parent_tree = parent_identity.get_module_tree(&global);
 
             {
                 let module_map = global.get_module_map().borrow();
@@ -825,24 +831,7 @@ impl ModuleOwner {
                 let document = document_from_node(&*script.root());
 
                 let load = {
-                    let module_tree = match module_identity.clone() {
-                        ModuleIdentity::ModuleUrl(script_src) => {
-                            debug!(
-                                "Going to finish external script from {}",
-                                script_src.clone()
-                            );
-                            let module_map = global.get_module_map().borrow();
-                            module_map.get(&script_src.clone()).unwrap().clone()
-                        },
-                        ModuleIdentity::ScriptId(script_id) => {
-                            debug!(
-                                "Going to finish internal script from {}",
-                                document.base_url().clone()
-                            );
-                            let inline_module_map = global.get_inline_module_map().borrow();
-                            inline_module_map.get(&script_id).unwrap().clone()
-                        },
-                    };
+                    let module_tree = module_identity.get_module_tree(&global);
 
                     let network_error = module_tree.get_network_error().borrow();
                     match network_error.as_ref() {
