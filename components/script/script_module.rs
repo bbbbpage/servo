@@ -37,7 +37,7 @@ use crate::task::TaskBox;
 use crate::task_source::TaskSourceName;
 use encoding_rs::UTF_8;
 use hyper_serde::Serde;
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
 use js::jsapi::Handle as RawHandle;
@@ -65,7 +65,7 @@ use net_traits::{FetchMetadata, Metadata};
 use net_traits::{FetchResponseListener, NetworkError};
 use net_traits::{ResourceFetchTiming, ResourceTimingType};
 use servo_url::ServoUrl;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -156,6 +156,8 @@ pub struct ModuleTree {
     // stdlib maps and sets because we rarely iterate over them.
     parent_identities: DomRefCell<IndexSet<ModuleIdentity>>,
     descendant_urls: DomRefCell<IndexSet<ServoUrl>>,
+    // A set to memoize which descendants are under fetching
+    incomplete_fetch_urls: DomRefCell<IndexSet<ServoUrl>>,
     visited_urls: DomRefCell<HashSet<ServoUrl>>,
     rethrow_error: DomRefCell<Option<RethrowError>>,
     network_error: DomRefCell<Option<NetworkError>>,
@@ -174,6 +176,7 @@ impl ModuleTree {
             status: DomRefCell::new(ModuleStatus::Initial),
             parent_identities: DomRefCell::new(IndexSet::new()),
             descendant_urls: DomRefCell::new(IndexSet::new()),
+            incomplete_fetch_urls: DomRefCell::new(IndexSet::new()),
             visited_urls: DomRefCell::new(visited_urls),
             rethrow_error: DomRefCell::new(None),
             network_error: DomRefCell::new(None),
@@ -222,51 +225,89 @@ impl ModuleTree {
         *self.text.borrow_mut() = module_text;
     }
 
+    pub fn get_incomplete_fetch_urls(&self) -> &DomRefCell<IndexSet<ServoUrl>> {
+        &self.incomplete_fetch_urls
+    }
+
+    pub fn get_descendant_urls(&self) -> &DomRefCell<IndexSet<ServoUrl>> {
+        &self.descendant_urls
+    }
+
+    pub fn get_parent_urls(&self) -> IndexSet<ServoUrl> {
+        let parent_identities = self.parent_identities.borrow();
+
+        parent_identities
+            .iter()
+            .filter_map(|parent_identity| match parent_identity {
+                ModuleIdentity::ScriptId(_) => None,
+                ModuleIdentity::ModuleUrl(url) => Some(url.clone()),
+            })
+            .collect()
+    }
+
     pub fn insert_parent_identity(&self, parent_identity: ModuleIdentity) {
         self.parent_identities.borrow_mut().insert(parent_identity);
     }
 
-    /// recursively checks if all of the transitive descendants are
-    /// in the FetchingDescendants or later status
-    fn recursive_check_descendants(
-        &self,
-        module_map: &HashMap<ServoUrl, Rc<ModuleTree>>,
-        discovered_urls: &mut HashSet<ServoUrl>,
-    ) -> bool {
-        discovered_urls.insert(self.url.clone());
+    pub fn insert_incomplete_fetch_url(&self, dependency: ServoUrl) {
+        self.incomplete_fetch_urls.borrow_mut().insert(dependency);
+    }
 
-        let descendant_urls = self.descendant_urls.borrow();
+    pub fn remove_incomplete_fetch_url(&self, dependency: ServoUrl) {
+        self.incomplete_fetch_urls.borrow_mut().remove(&dependency);
+    }
 
-        for descendant_url in descendant_urls.iter() {
-            match module_map.get(&descendant_url.clone()) {
-                Some(descendant_module) => {
-                    if discovered_urls.contains(&descendant_module.url) {
-                        continue;
+    // Find circular dependencies in non-recursive way
+    pub fn find_circular_dependencies(&self, global: &GlobalScope) -> IndexSet<ServoUrl> {
+        let module_map = global.get_module_map().borrow();
+
+        // A map for checking dependencies and using the module url as key
+        let mut module_deps: IndexMap<ServoUrl, IndexSet<ServoUrl>> = module_map
+            .iter()
+            .map(|(module_url, module)| {
+                (module_url.clone(), module.descendant_urls.borrow().clone())
+            })
+            .collect();
+
+        while module_deps.len() != 0 {
+            // Get all dependencies with no dependencies
+            let ready: IndexSet<ServoUrl> = module_deps
+                .iter()
+                .filter_map(|(module_url, descendant_urls)| {
+                    if descendant_urls.len() == 0 {
+                        Some(module_url.clone())
+                    } else {
+                        None
                     }
+                })
+                .collect();
 
-                    let descendant_status = descendant_module.get_status();
-                    if descendant_status < ModuleStatus::FetchingDescendants {
-                        return false;
-                    }
+            // If there's no ready module but we're still in the loop,
+            // it means we find circular modules, then we can return them.
+            if ready.len() == 0 {
+                return module_deps
+                    .iter()
+                    .map(|(url, _)| url.clone())
+                    .collect::<IndexSet<ServoUrl>>();
+            }
 
-                    let all_ready_descendants =
-                        descendant_module.recursive_check_descendants(module_map, discovered_urls);
+            // Remove ready modules from the dependency map
+            for module_url in ready.iter() {
+                module_deps.remove(&module_url.clone());
+            }
 
-                    if !all_ready_descendants {
-                        return false;
-                    }
-                },
-                None => return false,
+            // Also make sure to remove the ready modules from the
+            // remaining module dependencies as well
+            for (_, deps) in module_deps.iter_mut() {
+                *deps = deps
+                    .difference(&ready)
+                    .into_iter()
+                    .cloned()
+                    .collect::<IndexSet<ServoUrl>>();
             }
         }
 
-        return true;
-    }
-
-    fn has_all_ready_descendants(&self, module_map: &HashMap<ServoUrl, Rc<ModuleTree>>) -> bool {
-        let mut discovered_urls = HashSet::new();
-
-        return self.recursive_check_descendants(module_map, &mut discovered_urls);
+        IndexSet::new()
     }
 
     // We just leverage the power of Promise to run the task for `finish` the owner.
@@ -448,47 +489,6 @@ impl ModuleTree {
         }
     }
 
-    /// https://html.spec.whatwg.org/multipage/#fetch-the-descendants-of-a-module-script
-    /// Step 5.
-    pub fn resolve_requested_modules(
-        &self,
-        global: &GlobalScope,
-    ) -> Result<IndexSet<ServoUrl>, RethrowError> {
-        let status = self.get_status();
-
-        assert_ne!(status, ModuleStatus::Initial);
-        assert_ne!(status, ModuleStatus::Fetching);
-
-        let record = self.record.borrow();
-
-        if let Some(raw_record) = &*record {
-            let valid_specifier_urls = self.resolve_requested_module_specifiers(
-                &global,
-                raw_record.handle(),
-                self.url.clone(),
-            );
-
-            return valid_specifier_urls.map(|parsed_urls| {
-                parsed_urls
-                    .iter()
-                    .filter_map(|parsed_url| {
-                        let mut visited = self.visited_urls.borrow_mut();
-
-                        if !visited.contains(&parsed_url) {
-                            visited.insert(parsed_url.clone());
-
-                            Some(parsed_url.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<IndexSet<ServoUrl>>()
-            });
-        }
-
-        unreachable!("Didn't have record while resolving its requested module")
-    }
-
     #[allow(unsafe_code)]
     fn resolve_requested_module_specifiers(
         &self,
@@ -655,42 +655,74 @@ impl ModuleTree {
 
         self.set_status(ModuleStatus::FetchingDescendants);
 
-        match self.resolve_requested_modules(&global) {
+        let specifier_urls = {
+            let raw_record = self.record.borrow();
+            match raw_record.as_ref() {
+                // Step 1.
+                None => {
+                    self.set_status(ModuleStatus::Finished);
+                    debug!(
+                        "Module {} doesn't have module record but tried to load descendants.",
+                        self.url.clone()
+                    );
+                    return;
+                },
+                // Step 5.
+                Some(raw_record) => self.resolve_requested_module_specifiers(
+                    &global,
+                    raw_record.handle(),
+                    self.url.clone(),
+                ),
+            }
+        };
+
+        match specifier_urls {
             // Step 3.
-            Ok(requested_urls) if requested_urls.len() == 0 => {
+            Ok(valid_specifier_urls) if valid_specifier_urls.len() == 0 => {
+                debug!("Module {} doesn't have any dependencies.", self.url.clone());
                 self.advance_finished_and_link(&global);
             },
-            Ok(mut requested_urls) => {
+            Ok(valid_specifier_urls) => {
                 self.descendant_urls
                     .borrow_mut()
-                    .extend(requested_urls.clone());
+                    .extend(valid_specifier_urls.clone());
 
-                let parent_identities = self.parent_identities.borrow();
+                let mut urls = IndexSet::new();
+                let mut visited_urls = self.visited_urls.borrow_mut();
 
-                for parent_identity in parent_identities.iter() {
-                    match parent_identity {
-                        ModuleIdentity::ScriptId(_) => continue,
-                        ModuleIdentity::ModuleUrl(parent_url) => {
-                            if requested_urls.contains(&parent_url.clone()) {
-                                self.advance_finished_and_link(&global);
-                                requested_urls.remove(&parent_url.clone());
-                            }
-                        },
+                for parsed_url in valid_specifier_urls {
+                    // Step 5-3.
+                    if !visited_urls.contains(&parsed_url) {
+                        // Step 5-3-1.
+                        urls.insert(parsed_url.clone());
+                        // Step 5-3-2.
+                        visited_urls.insert(parsed_url.clone());
+
+                        self.insert_incomplete_fetch_url(parsed_url.clone());
                     }
                 }
 
-                for requested_url in requested_urls {
-                    // https://html.spec.whatwg.org/multipage/#internal-module-script-graph-fetching-procedure
-                    let visited_urls = self.visited_urls.borrow().clone();
+                // Step 3.
+                if urls.len() == 0 {
+                    debug!(
+                        "After checking with visited urls, module {} doesn't have dependencies to load.",
+                        self.url.clone()
+                    );
+                    self.advance_finished_and_link(&global);
+                    return;
+                }
 
+                // Step 8.
+                for url in urls {
+                    // https://html.spec.whatwg.org/multipage/#internal-module-script-graph-fetching-procedure
                     // Step 1.
-                    assert!(visited_urls.get(&requested_url).is_some());
+                    assert!(visited_urls.get(&url).is_some());
 
                     // Step 2.
                     fetch_single_module_script(
                         owner.clone(),
-                        requested_url.clone(),
-                        visited_urls,
+                        url.clone(),
+                        visited_urls.clone(),
                         destination.clone(),
                         Referrer::Client,
                         ParserMetadata::NotParserInserted,
@@ -711,14 +743,36 @@ impl ModuleTree {
     /// https://html.spec.whatwg.org/multipage/#fetch-the-descendants-of-and-link-a-module-script
     /// step 4-7.
     fn advance_finished_and_link(&self, global: &GlobalScope) {
-        // FIXME(cybai): try to find a better way for checking `ready` descendants
-        //               so that we don't need to always do recursive checking
         {
-            let module_map = global.get_module_map().borrow();
-            if self.get_status() != ModuleStatus::Finished &&
-                !self.has_all_ready_descendants(&module_map)
-            {
-                return;
+            let descendant_urls = self.descendant_urls.borrow();
+
+            // Check if there's any dependencies under fetching.
+            //
+            // We can't only check `incomplete fetches` here because...
+            //
+            // For example, module `A` has descendants `B`, `C`
+            // while `A` has added them to incomplete fetches, it's possible
+            // `B` has finished but `C` is not yet fired its fetch; in this case,
+            // `incomplete fetches` will be `zero` but the module is actually not ready
+            // to finish. Thus, we need to check dependencies directly instead of
+            // incomplete fetches here.
+            if !is_all_dependencies_ready(&descendant_urls, &global) {
+                // When we found the `incomplete fetches` is bigger than zero,
+                // we will need to check if there's any circular dependency.
+                //
+                // If there's no circular dependencies but there are incomplete fetches,
+                // it means it needs to wait for finish.
+                //
+                // Or, if there are circular dependencies, then we need to confirm
+                // no circular dependencies are fetching.
+                //
+                // if there's any circular dependencies and they all proceeds to status
+                // higher than `FetchingDescendants`, then it means we can proceed to finish.
+                let circular_deps = self.find_circular_dependencies(&global);
+
+                if circular_deps.len() == 0 || !is_all_dependencies_ready(&circular_deps, &global) {
+                    return;
+                }
             }
         }
 
@@ -726,31 +780,24 @@ impl ModuleTree {
 
         debug!("Going to advance and finish for: {}", self.url.clone());
 
-        let parent_identities = self.parent_identities.borrow();
-        for parent_identity in parent_identities.iter() {
-            let parent_tree = parent_identity.get_module_tree(&global);
+        {
+            // Notify parents of this module to finish
+            //
+            // Before notifying, if the parent module has already had zero incomplete
+            // fetches, then it means we don't need to notify it.
+            let parent_identities = self.parent_identities.borrow();
+            for parent_identity in parent_identities.iter() {
+                let parent_tree = parent_identity.get_module_tree(&global);
 
-            {
-                let module_map = global.get_module_map().borrow();
-                if !parent_tree.has_all_ready_descendants(&module_map) {
-                    return;
+                let incomplete_count_before_remove = {
+                    let incomplete_urls = parent_tree.get_incomplete_fetch_urls().borrow();
+                    incomplete_urls.len()
+                };
+
+                if incomplete_count_before_remove > 0 {
+                    parent_tree.remove_incomplete_fetch_url(self.url.clone());
+                    parent_tree.advance_finished_and_link(&global);
                 }
-            }
-
-            let parent_status = parent_tree.get_status();
-            if parent_status != ModuleStatus::Finished {
-                parent_tree.advance_finished_and_link(&global);
-            }
-        }
-
-        let descendant_urls = self.descendant_urls.borrow();
-        for descendant_url in descendant_urls.iter() {
-            let module_map = global.get_module_map().borrow();
-            let descendant_tree = module_map.get(&descendant_url.clone()).unwrap().clone();
-            if descendant_tree.get_status() != ModuleStatus::Finished &&
-                descendant_tree.has_all_ready_descendants(&module_map)
-            {
-                descendant_tree.advance_finished_and_link(&global);
             }
         }
 
@@ -782,6 +829,29 @@ impl ModuleTree {
             promise.resolve_native(&());
         }
     }
+}
+
+// Iterate the given dependency urls to see if it and its descendants are fetching or not.
+// When a module status is `FetchingDescendants`, it's possible that the module is a circular
+// module so we will also check its descendants.
+fn is_all_dependencies_ready(dependencies: &IndexSet<ServoUrl>, global: &GlobalScope) -> bool {
+    dependencies.iter().all(|dep| {
+        let module_map = global.get_module_map().borrow();
+        match module_map.get(&dep) {
+            Some(module) => {
+                let module_descendants = module.get_descendant_urls().borrow();
+
+                module.get_status() >= ModuleStatus::FetchingDescendants &&
+                    module_descendants.iter().all(|descendant_url| {
+                        match module_map.get(&descendant_url) {
+                            Some(m) => m.get_status() >= ModuleStatus::FetchingDescendants,
+                            None => false,
+                        }
+                    })
+            },
+            None => false,
+        }
+    })
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -972,51 +1042,46 @@ impl FetchResponseListener for ModuleContext {
             ))
         });
 
-        if let Err(err) = load {
-            // Step 9.
-            error!("Failed to fetch {} with error {:?}", self.url.clone(), err);
-            let module_tree = {
-                let module_map = global.get_module_map().borrow();
-                module_map.get(&self.url.clone()).unwrap().clone()
-            };
+        let module_tree = {
+            let module_map = global.get_module_map().borrow();
+            module_map.get(&self.url.clone()).unwrap().clone()
+        };
 
-            module_tree.set_network_error(err);
-            module_tree.advance_finished_and_link(&global);
-
-            return;
-        }
+        module_tree.remove_incomplete_fetch_url(self.url.clone());
 
         // Step 12.
-        if let Ok(ref resp_mod_script) = load {
-            let module_tree = {
-                let module_map = global.get_module_map().borrow();
-                module_map.get(&self.url.clone()).unwrap().clone()
-            };
+        match load {
+            Err(err) => {
+                error!("Failed to fetch {} with error {:?}", self.url.clone(), err);
+                module_tree.set_network_error(err);
+                module_tree.advance_finished_and_link(&global);
+            },
+            Ok(ref resp_mod_script) => {
+                module_tree.set_text(resp_mod_script.text());
 
-            module_tree.set_text(resp_mod_script.text());
+                let compiled_module = module_tree.compile_module_script(
+                    &global,
+                    resp_mod_script.text(),
+                    self.url.clone(),
+                );
 
-            let compiled_module = module_tree.compile_module_script(
-                &global,
-                resp_mod_script.text(),
-                self.url.clone(),
-            );
+                match compiled_module {
+                    Err(exception) => {
+                        module_tree.set_rethrow_error(exception);
+                        module_tree.advance_finished_and_link(&global);
+                    },
+                    Ok(record) => {
+                        module_tree.set_record(record);
 
-            match compiled_module {
-                Err(exception) => {
-                    module_tree.set_rethrow_error(exception);
-                    module_tree.advance_finished_and_link(&global);
-                },
-                Ok(record) => {
-                    module_tree.set_record(record);
-
-                    module_tree.fetch_module_descendants(
-                        &self.owner,
-                        self.destination.clone(),
-                        self.credentials_mode.clone(),
-                        ModuleIdentity::ModuleUrl(self.url.clone()),
-                    );
-                },
-            }
+                        module_tree.fetch_module_descendants(
+                            &self.owner,
+                            self.destination.clone(),
+                            self.credentials_mode.clone(),
+                            ModuleIdentity::ModuleUrl(self.url.clone()),
+                        );
+                    },
+                }
+            },
         }
     }
 
@@ -1230,6 +1295,8 @@ pub fn fetch_single_module_script(
     if let Some(parent_identity) = parent_identity {
         module_tree.insert_parent_identity(parent_identity);
     }
+
+    module_tree.insert_incomplete_fetch_url(url.clone());
 
     // Step 4.
     global.set_module_map(url.clone(), module_tree);
